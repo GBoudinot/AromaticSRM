@@ -1,0 +1,366 @@
+---
+title: "September14,2017"
+author: "Garrett"
+date: "9/14/2017"
+output: html_document
+---
+
+```{r "cleanup", echo = FALSE, eval=FALSE}
+# not run in knitted doc
+rm(list = ls())
+.rs.restartR()
+```
+
+
+```{r "load libraries", echo = FALSE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(stringr)
+library(knitr)
+library(readxl)
+library(tidyr)
+library(purrr)
+#library(xlsx)
+opts_chunk$set(dev=c("png", "pdf"), dev.args=list(pdf = list(encoding="WinAnsi", useDingbats=FALSE)),
+  fig.keep="all", fig.path = file.path("plots", "smoky_hollows_SRM")) ### CHANGE PLOT SUFFIX ###
+```
+
+#Read and organize data
+```{r}
+read_srm_export <- function(filename, columns = c("peak_name", "RT.min", "basepeak", "area.cpm", "height.cts", "quantitation")) {
+  filename %>% 
+    # read excel files
+    read_excel(sheet = "Integration", skip = 42, 
+               col_names = columns, col_types = rep("text", length(columns))) %>% 
+    as_data_frame() %>%
+    # remove empty rows
+    filter(!is.na(peak_name), peak_name != "n.a.") %>% 
+    # convert the relevant numeric columns into numbers
+    mutate_at(vars(RT.min, area.cpm, height.cts), as.numeric) %>% 
+    # remove useless columns
+    select(-basepeak, -quantitation) %>% 
+    # add filename info
+    mutate(file_id = gsub("\\.xls", "", basename(filename))) %>% 
+    select(file_id, everything())
+}
+
+# get data
+all_data <- 
+  # find all excel files
+  list.files("data_reports", recursive = TRUE, full.names = TRUE, pattern = "\\.xls$") %>% 
+  # send them to the read method
+  lapply(read_srm_export) %>% 
+  # combine the data set
+  bind_rows() %>% 
+  # pull out sample information
+  #mutate(sample_id = str_match(all_data$file_id, "TSQ\\d+_GB_(.*)$") %>% { .[,2] }) %>% 
+  # get n replicates
+  group_by(file_id)
+  #mutate(n_replicates = length(unique(file_id)))
+
+```
+
+#File names for metadata file
+```{r, echo=FALSE, eval=FALSE}
+# file names
+all_data$file_id %>% unique() %>%  paste(collapse = "\n") %>% message()
+```
+
+#Plot to check the spread
+##by sequence
+```{r}
+all_data %>% 
+  ggplot() + 
+  aes(x = peak_name, y = area.cpm, color = file_id) +
+  geom_point(size = 3) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+##by sample
+```{r}
+all_data %>% 
+  ggplot() +
+  aes(x = file_id, y = area.cpm, color = file_id) + 
+  geom_point(size = 3) +
+  facet_wrap(~peak_name, scales = "free_y") +
+    theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        legend.position = "none")
+```
+
+# Calculation peak amounts and rock concentrations
+
+```{r}
+depth_and_rock_info <- read_excel(file.path("metadata", "aromaticSRM_20180314.xlsx")) %>% 
+  rename(rock.g = `rock`) %>% 
+  filter(!is.na(file_id)) %>%
+  filter(process == "yes")
+kable(depth_and_rock_info)
+
+data_by_depth <- 
+  all_data %>%
+  left_join(depth_and_rock_info, by = "file_id") %>% 
+  group_by(file_id) %>% 
+  mutate(
+    n_peaks = n(),
+    n_standards = sum(peak_name == "d14-pTerph"),
+    ref_area.cpm = area.cpm[peak_name == "d14-pTerph"],
+    ref_amount_added.ug = 5, #check standard amount added
+    amount.ug = area.cpm/ref_area.cpm * ref_amount_added.ug,
+    conc_rock.ug_g = amount.ug / rock.g
+    #total_area.cpm = sum(area.cpm[peak_name != "d14-pTerph"]),
+    #area.percent = area.cpm / total_area.cpm * 100
+  )%>% ungroup() %>% 
+  arrange(file_id, peak_name)
+
+data_by_depth
+```
+
+# Calculate Recovery
+
+### Linear regressions of the calibration curves
+
+```{r}
+standard <- read_excel(file.path("metadata", "D14 calibration.xlsx"))   ###read excel
+
+###calibration curve
+standard %>% 
+  ggplot() +
+  aes(x = Known.ng, y = Measured_area.counts, color = calibration) + 
+  geom_smooth(method = "lm", alpha = 0.5) +
+  geom_point() +
+  theme_bw() +
+  theme(legend.position = "none") 
+
+calibrations <- 
+  standard %>% 
+  filter(!is.na(calibration)) %>% 
+  nest(-calibration) %>% 
+  mutate(
+    fit = map(data, ~summary(lm(`Measured_area.counts`~ `Known.ng`, data = .x))),
+    coefficients = map(fit, "coefficients"),
+    intercept = map_dbl(coefficients, `[`, 1, 1),
+    intercept_se = map_dbl(coefficients, `[`, 1, 2),
+    slope = map_dbl(coefficients, `[`, 2, 1),
+    slope_se = map_dbl(coefficients, `[`, 2, 2),
+    r2 = map_dbl(fit, "r.squared")
+  )
+
+View(calibrations)
+calibrations %>% select(-data, -fit, -coefficients) %>% knitr::kable(d = 3)
+```
+
+### Determine yield
+
+These numbers are not useful for anything else.
+
+```{r}
+calib_data <-
+  data_by_depth %>% 
+  # temp
+  mutate(calibration = "oct2017") %>% 
+  left_join(calibrations, by = "calibration") %>% 
+  mutate(
+    total_volume.uL = 100,
+    total_inject.uL = 1,
+    ref_amount_inject_expected.ng = ref_amount_added.ug/total_volume.uL * total_inject.uL * 1000,
+    ref_amount_inject_measured.ng = (ref_area.cpm - intercept)/slope,
+    ref_amount_measured.ug = total_volume.uL/total_inject.uL * ref_amount_inject_measured.ng * 1/1000,
+    yield = ref_amount_inject_measured.ng/ref_amount_inject_expected.ng
+  )
+  
+#View(calib_data)
+#calib_data_corr <- calib_data %>% mutate(conc_rock.ug_g = amount_yield_corr.ug / `rock `) #in microgram lipid per gram rock
+#View(calib_data_corr)
+```
+
+#### check yields
+
+```{r}
+calib_data %>% 
+  select(file_id, yield)  %>% 
+  arrange(file_id)  %>% 
+  unique() %>% 
+  ggplot() + aes(file_id, y = 100*yield) +
+  geom_point(size = 3) +
+  theme_bw() + theme(axis.text.x = element_text(angle = 90, hjust = 0, vjust = 0.5))
+```
+
+
+
+#Combine compounds/make ratios (new rows w/o RTs etc, just concentration.rock column)
+
+```{r}
+# functions to make it easy to sum up peaks
+
+sum_peaks <- function(df, filter_condition, new_peak_name) {
+  filter_condition <- sprintf("(%s)", str_c(filter_condition, collapse = "|"))
+  filter(df, str_detect(peak_name, filter_condition)) %>% 
+    summarize(
+      file_id = file_id[1],
+      depth = depth[1],
+      conc_rock.ug_g = sum(conc_rock.ug_g)
+    ) %>% 
+    mutate(peak_name = new_peak_name)
+}
+
+ratio_peaks <- function(df, filter_top, filter_bottom, new_peak_name) {
+  filter_top <- sprintf("(%s)", str_c(filter_top, collapse = "|"))
+  filter_bottom <- sprintf("(%s)", str_c(filter_bottom, collapse = "|"))
+  filter(df, str_detect(peak_name, filter_top) | str_detect(peak_name, filter_bottom)) %>% 
+    summarize(
+      file_id = file_id[1],
+      depth = depth[1],
+      ratio = sum(conc_rock.ug_g[str_detect(peak_name, filter_top)]) / sum(conc_rock.ug_g[str_detect(peak_name, filter_bottom)])
+    ) %>% 
+    mutate(peak_name = new_peak_name)
+}
+```
+
+
+```{r}
+final_data <- data_by_depth %>% 
+    group_by(file_id) %>% 
+        do({
+          bind_rows(., 
+              sum_peaks(., "C15", "all C15"),
+              sum_peaks(., "C16", "all C16"),
+              sum_peaks(., "C17", "all C17"),
+              sum_peaks(., "C18", "all C18"),
+              sum_peaks(., "C19", "all C19"),
+              sum_peaks(., "C20", "all C20"),
+              sum_peaks(., "C21", "all C21"),
+              sum_peaks(., "C24", "all C24"),
+              sum_peaks(., "C26", "all C26"),
+              sum_peaks(., "Aryl", "all_Aryl_Isop"),
+              #sum_peaks(., "MP", "3ring_MP"),
+              sum_peaks(., c("Acenapthene", "Flourene"), "2ring_all" ),
+              #sum_peaks(., "Acenapthene", "2ring_1"),
+              #sum_peaks(., "Flourene", "2ring_2"),
+              sum_peaks(., c("Phenanthrene", "Flourantherene", "Retene", "MP"), "3ring_all" ),
+              #sum_peaks(., "Phenanthrene", "3ring_1"),
+              #sum_peaks(., "Flourantherene", "3ring_2"),
+              #sum_peaks(., "Retene", "3ring_3"),
+              sum_peaks(., c("Pyrene", "Benzo[a]anthracene", "Triphenylene", "Chrysene", "flouranthrene"), "4ring_all" ),
+              #sum_peaks(., "Pyrene", "4ring_1"),
+              #sum_peaks(., "Benzo[a]anthracene", "4ring_2"),
+              #sum_peaks(., "Triphenylene", "4ring_3"),
+              #sum_peaks(., "Chrysene", "4ring_4"),
+              #sum_peaks(., "flouranthrene", "4ring_5s"),
+              sum_peaks(., c("Benzo[e]pyrene", "Benzo[a]pyrene", "Perylene", "Ideno", "Dibenz"), "5ring_all" ),
+              #sum_peaks(., "Benzo[e]pyrene", "5ring_1"),
+              #sum_peaks(., "Benzo[a]pyrene", "5ring_2"),
+              #sum_peaks(., "Perylene", "5ring_3"),
+              #sum_peaks(., "Ideno[c,e]", "5ring_4"),
+              #sum_peaks(., "Dibenz[a,h]", "5ring_5"),
+              sum_peaks(., c("Benzo[ghi]", "Coronene"), "6ring_all" ), 
+              sum_peaks(., c("Acenapthene", "Flourene", "Phenanthrene", "Flourantherene", "Retene", "Pyrene", "Benzo[a]anthracene", "Triphenylene", "Chrysene", "flouranthrene", "Benzo[e]pyrene", "Benzo[a]pyrene", "Perylene", "Ideno[c,e]", "Dibenz[a,h]", "Benzo[ghi]", "Coronene"), "all_PAH")
+              #sum_peaks(., "Benzo[ghi]", "6ring_1"),
+              #sum_peaks(., "Coronene", "6ring_2")
+ ) }) %>% ungroup() 
+  
+View(final_data)
+
+
+```
+
+
+
+#### Against depth
+
+```{r "overview_against_depth", fig.width = 10, fig.height = 8}
+final_data %>% 
+  ggplot() +
+  aes(x = conc_rock.ug_g, y = depth, color = file_id) +
+  geom_point() +
+  facet_wrap(~peak_name, scales = "free") +
+  scale_y_reverse() 
+
+```
+
+```{r}
+ 
+final_data_onset <- subset(final_data, depth>102)
+
+#View(final_data_onset)
+
+final_data_pah <- subset(final_data_onset, depth<123)
+
+final_data_iso <- subset(final_data, peak_name=="Isoren")
+View(final_data_iso)
+
+
+
+```
+
+
+
+##By compound
+###D14
+```{r "overview_against_depth", fig.width = 10, fig.height = 8}
+
+subset(final_data, peak_name=='d14-pTerph') %>% 
+    ggplot() +
+    aes(x = amount.ug, y = depth) +
+    geom_point() +
+    #facet_wrap(~peak_name, scales = "free") +
+    scale_y_reverse() 
+    
+    
+
+```
+
+###Isorenieretane
+```{r "overview_against_depth", fig.width = 10, fig.height = 8}
+
+subset(final_data, peak_name=='Isorenieretane') %>%
+  ggplot() +
+  aes(x = conc_rock.ug_g, y = depth) +
+  geom_point() +
+  #facet_wrap(~peak_name, scales = "free") 
+  scale_y_reverse() 
+
+```
+
+###Chlorobactane
+```{r "overview_against_depth", fig.width = 10, fig.height = 8}
+
+subset(final_data, peak_name=='Chlorobactane') %>%
+  ggplot() +
+  aes(x = conc_rock.ug_g, y = depth) +
+  geom_point() +
+  #facet_wrap(~peak_name, scales = "free") 
+  scale_y_reverse() 
+
+```
+
+###all Aryls
+```{r "overview_against_depth", fig.width = 10, fig.height = 8}
+
+subset(final_data, peak_name=='all_Aryl_Isop') %>%
+  ggplot() +
+  aes(x = conc_rock.ug_g, y = depth) +
+  geom_point() +
+  #facet_wrap(~peak_name, scales = "free") 
+  scale_y_reverse() 
+
+```
+
+
+###all PAHs
+```{r "overview_against_depth", fig.width = 10, fig.height = 8}
+
+subset(final_data, peak_name=='all_PAH') %>%
+  #filter(!is.na(depth==108)) %>%
+    ggplot() +
+    aes(x = conc_rock.ug_g, y = depth) +
+    geom_point() +
+    #facet_wrap(~peak_name, scales = "free") 
+    scale_y_reverse() 
+
+```
+
+```{r}
+ggplotly(ggplot2::last_plot() + theme(legend.position = "none"))
+```
